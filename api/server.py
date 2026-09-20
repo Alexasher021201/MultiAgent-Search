@@ -9,8 +9,9 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import uuid
 import asyncio
 import uvicorn
+from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles as FastAPIStaticFiles
@@ -24,11 +25,25 @@ project_root = current_dir.parent
 sys.path.insert(0, str(project_root))
 
 # Import agent runner and monitor
-# 注意：agent.main_agent 导入时会初始化 main_agent，这可能需要几秒钟
-from agent.main_agent import run_deep_agent
+from agent.main_agent import checkpoint_db_path, create_main_agent, run_deep_agent
 from api.monitor import manager
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-app = FastAPI(title="DeepAgents API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """管理异步 SQLite checkpoint 的连接生命周期。"""
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_db_path)) as checkpointer:
+        await checkpointer.setup()
+        app.state.main_agent = create_main_agent(checkpointer)
+        print(f"[Server] Async SQLite checkpointer ready: {checkpoint_db_path}")
+        loop = asyncio.get_running_loop()
+        manager.set_loop(loop)
+        print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
+        yield
+
+
+app = FastAPI(title="DeepAgents API", lifespan=lifespan)
 
 # 挂载输出目录，以便前端访问生成的静态文件
 # 假设输出目录位于项目根目录下的 output
@@ -67,25 +82,14 @@ class TaskRequest(BaseModel):
     query: str
     thread_id: str = None
 
-@app.on_event("startup")
-async def startup_event():
-    """
-    服务启动时，获取当前运行的事件循环，并绑定到 WebSocket 管理器。
-    确保后台线程能通过 run_coroutine_threadsafe 准确投递消息。
-    """
-    loop = asyncio.get_running_loop()
-    manager.set_loop(loop)
-    print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
-
-
 @app.post("/api/task")
-async def run_task(request: TaskRequest):
+async def run_task(task: TaskRequest, http_request: Request):
     # 1. [ID 初始化]
-    thread_id = request.thread_id or str(uuid.uuid4())
+    thread_id = task.thread_id or str(uuid.uuid4())
 
     # 2. [后台执行] 异步运行 Agent，不阻塞主线程
     # 注意：这里简单的使用 asyncio.create_task 触发，由 main_agent 内部负责实时推送
-    asyncio.create_task(run_deep_agent(request.query, thread_id))
+    asyncio.create_task(run_deep_agent(task.query, thread_id, http_request.app.state.main_agent))
 
     # 3. [立即响应]
     return {"status": "started", "thread_id": thread_id}

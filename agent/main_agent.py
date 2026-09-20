@@ -1,8 +1,7 @@
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.network_search_agent import network_search_agent
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # main_agent tool导入
 from tools.markdown_tools import generate_markdown
@@ -11,7 +10,7 @@ from tools.upload_file_read_tool import read_file_content
 
 from deepagents import create_deep_agent
 
-from agent.llm import model
+from agent.llm import max_output_tokens, model, request_timeout_seconds
 from agent.prompts import main_agent_content
 
 from api.monitor import monitor
@@ -24,24 +23,25 @@ from api.context import set_session_context, reset_session_context, set_thread_c
 
 from langchain_core.messages import AIMessage
 
-# 持久化 checkpoint：使用 SQLite 替代内存存储
-# 服务重启后对话历史不丢失，支持多轮对话上下文
+# 持久化 checkpoint 数据库路径。连接和保存器由 FastAPI lifespan 创建、关闭，
+# 以便与 main_agent.astream() 的异步调用方式匹配。
 checkpoint_db_path = Path(__file__).parents[1] / "data" / "checkpoints.db"
 checkpoint_db_path.parent.mkdir(parents=True, exist_ok=True)
-_conn = sqlite3.connect(str(checkpoint_db_path), check_same_thread=False)
-checkpointer = SqliteSaver(_conn)
 
-main_agent = create_deep_agent(
-   model = model,
-   system_prompt=main_agent_content['system_prompt'],
-   tools= [generate_markdown,convert_md_to_pdf,read_file_content],
-   checkpointer=checkpointer,
-   subagents=[
-       database_query_agent,
-       network_search_agent,
-       knowledge_base_agent
-   ]
-)
+
+def create_main_agent(checkpointer: AsyncSqliteSaver):
+    """创建使用异步 SQLite checkpoint 的主智能体。"""
+    return create_deep_agent(
+        model=model,
+        system_prompt=main_agent_content['system_prompt'],
+        tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+        checkpointer=checkpointer,
+        subagents=[
+            database_query_agent,
+            network_search_agent,
+            knowledge_base_agent,
+        ],
+    )
 
 # 执行
 """
@@ -61,12 +61,28 @@ project_root_path = Path(__file__).parents[1].resolve() # 绝对 解析路径标
 # main_agent.invoke()
 # main_agent.stream()
 # main_agent.astream() [选他]
-async def run_deep_agent(task_query,session_id):
+async def stream_agent_with_idle_timeout(main_agent, agent_input, config):
+    """在 LangGraph 连续指定秒数没有产出事件时主动终止任务。"""
+    stream = main_agent.astream(agent_input, config=config)
+    while True:
+        try:
+            async with asyncio.timeout(request_timeout_seconds):
+                yield await anext(stream)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as error:
+            raise TimeoutError(
+                f"模型或工具连续 {request_timeout_seconds:g} 秒没有响应，任务已停止。"
+            ) from error
+
+
+async def run_deep_agent(task_query, session_id, main_agent):
     """
     定义流式+异步执行主智能体！！
     执行过程中，返回  会话文件化返回  调用子智能体  调用最终结果 （monitor）
     task_query: 前端提问的问题
     session_id: 每个前端会话对应的标识 （1.存储session_id ContextVars 2.session_id 给他创建对应的output输出地址）
+    main_agent: 在 FastAPI lifespan 中创建的异步 checkpoint 主智能体
     """
     print(f"当前会话的main_agent开始执行了！ 会话id:{session_id}")
     # 准备工作 【1. session_dir（前端） 2. relative_session_dir (大模型) 3. 上传的文件拼接上传文件专属提示词】
@@ -126,14 +142,20 @@ async def run_deep_agent(task_query,session_id):
     """
     # 反馈结果
     try:
+        monitor._emit(
+            "model_start",
+            "正在请求模型生成执行计划，请等待响应…",
+            {"max_output_tokens": max_output_tokens},
+        )
         # 执行
-        async for chunk in main_agent.astream({
+        agent_input = {
             "messages":[
                 {
                     "role":"user","content":task_query+path_instruction
                 }
             ]
-        },config=config):
+        }
+        async for chunk in stream_agent_with_idle_timeout(main_agent, agent_input, config):
             # {"model [大模型决定调用工具 子智能体  最终结果] / tools" : {messages:[xxx...]}}
             for node_name,state in chunk.items():
                 if not state or "messages" not in state: continue

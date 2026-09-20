@@ -13,7 +13,7 @@ from utils.retry import retry_with_backoff
 # ======================== 初始化配置 ========================
 load_dotenv()
 
-# Tavily 客户端（超时 30 秒，防止网络卡死）
+# Tavily 客户端（超时 30 秒，防止网络卡死）,真正的搜索由第三方平台 Tavily 提供，Tavily 需要注册账号并获取 API Key。
 tavily_client = TavilyClient(
     api_key=os.getenv("TAVILY_API_KEY"),
 )
