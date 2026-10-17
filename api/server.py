@@ -27,6 +27,7 @@ sys.path.insert(0, str(project_root))
 # Import agent runner and monitor
 from agent.main_agent import checkpoint_db_path, create_main_agent, run_deep_agent
 from api.monitor import manager
+from agent.execution_policy import RetrievalMode
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 
@@ -81,18 +82,22 @@ app.add_middleware(
 class TaskRequest(BaseModel):
     query: str
     thread_id: str = None
+    retrieval_mode: RetrievalMode = RetrievalMode.AUTO
+    allow_web: bool = True
 
 @app.post("/api/task")
 async def run_task(task: TaskRequest, http_request: Request):
     # 1. [ID 初始化]
     thread_id = task.thread_id or str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
 
     # 2. [后台执行] 异步运行 Agent，不阻塞主线程
     # 注意：这里简单的使用 asyncio.create_task 触发，由 main_agent 内部负责实时推送
-    asyncio.create_task(run_deep_agent(task.query, thread_id, http_request.app.state.main_agent))
+    asyncio.create_task(run_deep_agent(task.query, thread_id, http_request.app.state.main_agent,
+                                     task.retrieval_mode.value, task.allow_web, run_id))
 
     # 3. [立即响应]
-    return {"status": "started", "thread_id": thread_id}
+    return {"status": "started", "thread_id": thread_id, "run_id": run_id}
 
 
 @app.post("/api/upload")

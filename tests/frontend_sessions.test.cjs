@@ -149,3 +149,18 @@ test('transport loss does not masquerade as completion or allow overlapping turn
   p.run('newSession()');
   assert.equal(p.element('#sendBtn').disabled, false);
 });
+
+test('the selected retrieval mode is sent and policy denials are not terminal errors', async () => {
+  const p = page();
+  p.element('#retrievalMode').value = 'RAG_ONLY';
+  const sending = p.send('Only use the knowledge base');
+  p.sockets[0].open();
+  await sending;
+  assert.equal(p.requests[0].retrieval_mode, 'RAG_ONLY');
+  p.sockets[0].event('policy_blocked', { error_code: 'WEB_FORBIDDEN' });
+  assert.equal(p.run('sessions[activeSessionId].status'), 'running');
+  assert.equal(p.element('#sendBtn').disabled, true);
+  assert.match(p.element('#logArea').innerHTML, /拦截/);
+  p.sockets[0].event('task_result', { result: 'No relevant knowledge' });
+  assert.equal(p.element('#sendBtn').disabled, false);
+});

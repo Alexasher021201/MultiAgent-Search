@@ -1,46 +1,41 @@
-# 定义一个网络搜索的工具！
-# ======================== 导入核心依赖 ========================
-from typing import Literal
-from langchain_core.tools import tool
-from tavily import TavilyClient
+"""网络搜索适配：工具额度和实际 HTTP 重试额度均由本轮执行上下文控制。"""
 
 import os
+import time
+from typing import Literal
+
 from dotenv import load_dotenv
+from langchain_core.tools import tool
+from tavily import TavilyClient
+from tavily.errors import UsageLimitExceededError, TimeoutError as TavilyTimeoutError
+import requests
 
+from agent.run_context import authorize_tool, get_run_context
 from api.monitor import monitor
-from utils.retry import retry_with_backoff
 
-# ======================== 初始化配置 ========================
 load_dotenv()
-
-# Tavily 客户端（超时 30 秒，防止网络卡死）,真正的搜索由第三方平台 Tavily 提供，Tavily 需要注册账号并获取 API Key。
-tavily_client = TavilyClient(
-    api_key=os.getenv("TAVILY_API_KEY"),
-)
+tavily_client = None
 
 
-# ======================== 带重试的搜索封装 ========================
-
-@retry_with_backoff(
-    max_retries=3,
-    base_delay=1.0,
-    max_delay=10.0,
-    exceptions=(Exception,),
-)
-def _search_with_retry(query: str, topic: str, max_results: int, include_raw_content: bool):
-    """
-    对 Tavily 搜索调用包装指数退避重试。
-    网络抖动或 Tavily 临时不可用时自动重试，最多 3 次。
-    """
-    return tavily_client.search(
-        query=query,
-        topic=topic,
-        max_results=max_results,
-        include_raw_content=include_raw_content,
-    )
+def _client():
+    global tavily_client
+    if tavily_client is None:
+        tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+    return tavily_client
 
 
-# ======================== LangChain 工具定义 ========================
+def _search_with_retry(query, topic, max_results, include_raw_content):
+    ctx = get_run_context()
+    for attempt in range(2):
+        ctx.reserve_http()
+        try:
+            return _client().search(query=query, topic=topic, max_results=max_results,
+                                    include_raw_content=include_raw_content, timeout=20)
+        except (requests.Timeout, requests.ConnectionError, TavilyTimeoutError, UsageLimitExceededError):
+            if attempt == 1:
+                raise
+            time.sleep(0.5)
+
 
 @tool
 def internet_search(
@@ -48,31 +43,10 @@ def internet_search(
     topic: Literal["news", "finance", "general"] = "general",
     max_results: int = 5,
     include_raw_content: bool = False,
-):
-    """
-    根据用户问题，进行网络信息搜索！
-    注意：主要搜索公开的网络信息！如果指定查询数据库或者rag不能使用此工具！
-    :param query: 用户的查询信息
-    :param topic: 查询的类型 (general/news/finance)
-    :param max_results: 返回的最大条数
-    :param include_raw_content: 是否返回原内容 False 精简 True 详细
-    :return: 搜索结果
-    """
-    # 每次调用工具，都向前端推送调用进度
-    monitor.report_tool(
-        tool_name="网络搜索工具",
-        args={
-            "query": query,
-            "topic": topic,
-            "max_results": max_results,
-            "include_raw_content": include_raw_content,
-        },
-    )
-
-    # 带重试的搜索调用（指数退避，最多 3 次）
-    return _search_with_retry(
-        query=query,
-        topic=topic,
-        max_results=max_results,
-        include_raw_content=include_raw_content,
-    )
+) -> dict:
+    """按执行层检索模式搜索公开信息。禁止联网、RAG 未完成或额度不足时不会访问网络。"""
+    args = {"query": query, "topic": topic, "max_results": max_results,
+            "include_raw_content": include_raw_content}
+    with authorize_tool("internet_search", args):
+        monitor.report_tool("网络搜索工具", args)
+        return _search_with_retry(query, topic, max_results, include_raw_content)

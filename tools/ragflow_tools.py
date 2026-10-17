@@ -1,115 +1,193 @@
-#  get_assistant_list 获取聊天助手和知识库信息
-#  create_ask_delete  创建提问和删除会话获取rag查询结果
-from langchain_core.tools import tool
-import re
-# 导入依赖
-from ragflow_sdk import RAGFlow #链接rag服务的客户端
+"""RAGFlow 适配：返回结构化事实，不通过答案关键词猜测是否命中。"""
 
+import logging
+from time import monotonic
+
+from langchain_core.tools import tool
+from ragflow_sdk import RAGFlow
+import requests
+
+from agent.run_context import PolicyViolation, authorize_tool, get_run_context
 from api.monitor import monitor
 from rawflow.rag_config import _load_ragflow_env
 
-# 创建一个ragflow的客户端
-api_key , base_url =_load_ragflow_env()
-ragflow_client = RAGFlow(api_key=api_key,base_url=base_url)
+logger = logging.getLogger(__name__)
+ragflow_client = None  # 延迟初始化；离线测试可替换为 fake client。
+
+_PHASE_NAMES = {"discovery": "查询助手列表", "resolve_assistant": "确认助手",
+                "create_session": "创建临时会话", "ask": "生成知识库回答", "cleanup": "清理临时会话"}
 
 
+class RagTransportError(Exception):
+    """保留安全诊断信息，不把带地址或凭证的上游异常正文发给前端。"""
 
-# 1. 查询现在知识库中有哪些聊天助手和对应知识库的信息 （方便我们知道rag可以给我们提供哪些数据）
+    def __init__(self, phase, error_type, timed_out, timeout_seconds, elapsed_ms):
+        super().__init__(f"RAG HTTP {phase}: {error_type}")
+        self.phase = phase
+        self.error_type = error_type
+        self.timed_out = timed_out
+        self.timeout_seconds = timeout_seconds
+        self.elapsed_ms = elapsed_ms
+
+
+class _BoundedRAGFlow(RAGFlow):
+    """当前 SDK 没有传输超时；为所有 HTTP 方法设置边界。"""
+
+    def _request(self, method, path, **kwargs):
+        ctx = get_run_context()
+        phase = ("ask" if path.endswith("/completions") else
+                 "cleanup" if method == "DELETE" else
+                 "create_session" if method == "POST" and path.endswith("/sessions") else
+                 "resolve_assistant" if (kwargs.get("params") or {}).get("id") else "discovery")
+        policy = ctx.policy
+        remaining = ctx.remaining_seconds()
+        read_limit = (policy.rag_completion_timeout_seconds if phase == "ask" else
+                      policy.rag_cleanup_timeout_seconds if phase == "cleanup" else
+                      policy.rag_request_timeout_seconds)
+        connect = min(policy.rag_connect_timeout_seconds, remaining)
+        read = min(read_limit, remaining)
+        started = monotonic()
+        try:
+            response = requests.request(method, self.api_url + path, headers=self.authorization_header,
+                                        timeout=(connect, read), **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as error:
+            elapsed_ms = round((monotonic() - started) * 1000)
+            timed_out = isinstance(error, requests.Timeout)
+            limit = connect if isinstance(error, requests.ConnectTimeout) else read
+            logger.warning("RAG HTTP failed run_id=%s phase=%s error_type=%s elapsed_ms=%s timeout_s=%s",
+                           ctx.run_id, phase, type(error).__name__, elapsed_ms, limit)
+            raise RagTransportError(phase, type(error).__name__, timed_out, limit, elapsed_ms) from error
+        finally:
+            ctx.emit("rag_http_finished", f"知识库阶段：{_PHASE_NAMES[phase]}，耗时 {monotonic() - started:.2f} 秒",
+                     phase=phase, elapsed_ms=round((monotonic() - started) * 1000),
+                     connect_timeout_seconds=connect, read_timeout_seconds=read)
+
+    def get(self, path, params=None, json=None):
+        return self._request("GET", path, params=params, json=json)
+
+    def post(self, path, json=None, stream=False, files=None):
+        return self._request("POST", path, json=json, stream=stream, files=files)
+
+    def delete(self, path, json):
+        return self._request("DELETE", path, json=json)
+
+    def put(self, path, json):
+        return self._request("PUT", path, json=json)
+
+
+def _client():
+    global ragflow_client
+    if ragflow_client is None:
+        api_key, base_url = _load_ragflow_env()
+        if not api_key or not base_url:
+            raise ValueError("缺少 RAGFLOW_API_KEY 或 RAGFLOW_API_URL")
+        ragflow_client = _BoundedRAGFlow(api_key=api_key, base_url=base_url)
+    return ragflow_client
+
+
+def _error(error, code="RAG_REQUEST_FAILED", *, phase="ask", elapsed_ms=None):
+    # 不向模型或前端暴露上游异常原文。
+    timed_out = isinstance(error, (requests.Timeout, TimeoutError)) or getattr(error, "timed_out", False)
+    phase = getattr(error, "phase", phase)
+    message = (f"知识库在{_PHASE_NAMES.get(phase, phase)}阶段超时，本轮未获得有效检索结果。"
+               "请稍后重试，或检查 RAGFlow 模型响应时间及超时配置。") if timed_out else "知识库调用失败，请检查服务配置或运行日志"
+    return {"status": "error", "answer": "", "sources": [],
+            "error_code": "RAG_TIMEOUT" if timed_out else code,
+            "error_type": getattr(error, "error_type", type(error).__name__), "message": message,
+            "phase": phase, "elapsed_ms": getattr(error, "elapsed_ms", elapsed_ms),
+            "timeout_seconds": getattr(error, "timeout_seconds", None)}
+
+
 @tool
-def get_assistant_list() -> str:
-    """
-    调用此工具，可以查询ragflow服务器中有哪些助手和助手关联的知识库信息！
-    供模型参考，可以从哪个助手获取对应的内部文档信息！
-    强调：想向某个助手提问，必须想要调用此工具查询助手的信息和名称
-    返回结果： 有-> 名称:助手名称,助手描述：xxxx,关联的知识库：知识库的名、知识库的名字、
-             没有 -> 没有任何可用助手
-             异常 -> 查询助手信息异常，无可用助手
-    :return:
-    """
+def get_assistant_list() -> dict:
+    """查询真实 RAGFlow 助手及关联知识库。名称必须来自本轮列表；只允许发现一次。"""
+    with authorize_tool("get_assistant_list", {}) as ctx:
+        monitor.report_tool("ragflow聊天助手列表查询工具：get_assistant_list")
+        try:
+            chats = _client().list_chats(page_size=100)
+            assistants = []
+            registry = {}
+            duplicate_names = set()
+            for chat in chats:
+                datasets = [item.get("name", "") if isinstance(item, dict) else getattr(item, "name", "")
+                            for item in (getattr(chat, "datasets", None) or [])]
+                info = {"id": chat.id, "name": chat.name,
+                        "description": getattr(chat, "description", ""), "datasets": datasets}
+                assistants.append(info)
+                if chat.name in registry:
+                    duplicate_names.add(chat.name)
+                registry[chat.name] = info
+            for name in duplicate_names:
+                registry.pop(name, None)
+            if len(chats) >= 100:
+                return _error(ValueError("列表可能被截断"), "RAG_DISCOVERY_TRUNCATED")
+            if duplicate_names:
+                return _error(ValueError("助手名称重复"), "RAG_DUPLICATE_NAMES")
+            ctx.set_assistants(registry)
+            return {"status": "success" if assistants else "no_assistant", "assistants": assistants,
+                    "ambiguous_names": sorted(duplicate_names), "error_code": None}
+        except PolicyViolation:
+            raise
+        except Exception as error:
+            return _error(error, "RAG_DISCOVERY_FAILED", phase="discovery")
 
-    # 埋点,调用工具了告诉前端哪个工具被调用了！！
-    monitor.report_tool(tool_name="ragflow聊天助手列表查询工具：get_assistant_list")
 
-    # 1. 创建ragflow客户端
-    try:
-        # 2. ragflow客户端查询所有的聊天助手 page: int = 1, page_size: int = 30
-        chat_list = ragflow_client.list_chats()
-        if not chat_list:
-            return "没有任何可用助手"
-        # 3. 查询聊天助手的知识库信息
-        count_chat_info = "" #存储所有会话信息
-        for chat in chat_list:
-            dataset_names = []
-            dataset_list = chat.datasets #当前聊天助手关联的知识库
-            if dataset_list and isinstance(dataset_list,list):
-                # 知识库的name
-                for dataset in dataset_list:
-                    # print(dataset)
-                    dataset_names.append(dataset['name']) # 将一个助手的知识库的名字加入到列表中
-
-            # 拼接格式: 助手名称 + 介绍 + 关联知识库列表
-            count_chat_info += f"助手名称:{chat.name};功能介绍：{chat.description}; 关联的知识库：{'、'.join(dataset_names)} \n"
-        return count_chat_info
-    except Exception as e:
-        return f"查询助手信息异常，无可用助手,异常信息:{str(e)}"
-
-def _retrieval_question(question: str) -> str:
-    """提取明确标注的查询问题，防止把委派指令传给检索引擎。"""
+@tool
+def create_ask_delete(chat_name: str, question: str) -> dict:
+    """用本轮真实助手查询原始问题，返回答案、引用和状态；结束后清理临时会话。"""
+    # 原始问题已经由固定工作流传入，不再用正则擅自删改用户问题。
     question = question.strip()
-    match = re.search(r'查询并回答\s*[:：]\s*["“](.+?)["”]\s*要求\s*[:：]', question, re.DOTALL)
-    return match.group(1).strip() if match else question
-
-
-# 2. 对某个助手进行提问（创建会话 -》 提问 -》 删除会话）
-@tool
-def create_ask_delete(chat_name: str, question: str) -> str:
-    """
-    想某个助手，创建单次会话进行提问，提问完毕以后会关闭会话！
-    主要查询ragflow中相关的信息！
-    注意：调用此工具之前，必须先调用 get_assistant_list工具明确查询助手的名字和对应的问题
-    :param chat_name: 助手的名字！上一个工具get_assistant_list告诉大模型的只有名字
-    :param question: 只传用户要查的简短问题，例如“退款金额超过500元由谁审批？”。
-        不要传整段委派任务、读取文件指令、输出格式、版本比较等要求。
-    :return: 返回提问的结果
-    """
-    # 埋点,调用工具了告诉前端哪个工具被调用了！！
-    question = _retrieval_question(question)
-    monitor.report_tool(tool_name="ragflow提问助手工具：create_ask_delete",args={"chat_name":chat_name,"question":question})
-    print(f"[RAGFlow] assistant={chat_name!r}, question={question!r}")
-    # 1. 创建ragflow客户端
-    # 2. 查询对应name的chat
-    use_chat = None
-    session = None
-    try:
-        chats = ragflow_client.list_chats(name=chat_name)
-        matches = [chat for chat in chats if chat.name == chat_name]
-        if len(matches) != 1:
-            return "提问失败：助手不存在或名称重复，请重新调用 get_assistant_list 确认助手名称。"
-        use_chat = matches[0]
-        # 3. chat上创建一个会话
-        session = use_chat.create_session(name="temp_session_ask")
-        # 4. 使用会话进行提问
-        # 返回的提问结果是流式
-        response = session.ask(question = question,stream=True)
-        # 接收总结果
-        result = ""
-        # 流的每一部分的对象 part
-        for part in response:
-            # 数据存在对象中content上！！
-            # print(part.content)
-            result = part.content
-        print(f"[RAGFlow] answer={result!r}")
+    with authorize_tool("create_ask_delete", {"chat_name": chat_name, "question": question}) as ctx:
+        monitor.report_tool("ragflow提问助手工具：create_ask_delete", {"chat_name": chat_name})
+        chat = session = None
+        phase = "resolve_assistant"
+        started = monotonic()
+        try:
+            info = ctx.assistants[chat_name]
+            chats = _client().list_chats(id=info["id"])
+            matches = [item for item in chats if item.id == info["id"]]
+            if len(matches) != 1:
+                raise ValueError("已发现的助手不存在或标识不唯一")
+            chat = matches[0]
+            phase = "create_session"
+            session = chat.create_session(name=f"run_{ctx.run_id}")
+            # SDK 的非流式 ask 也返回生成器，避免无限续流绕过读超时。
+            answer = ""
+            references = None
+            phase = "ask"
+            for part in session.ask(question=question, stream=False):
+                answer = getattr(part, "content", "") or ""
+                if getattr(part, "reference", None) is not None:
+                    references = part.reference
+            sources = []
+            for ref in references or []:
+                if not isinstance(ref, dict):
+                    continue
+                text = ref.get("content") or ref.get("content_with_weight") or ""
+                if text:
+                    sources.append({"document_id": ref.get("document_id") or ref.get("doc_id"),
+                                    "document_name": ref.get("document_name") or ref.get("docnm_kwd"),
+                                    "content": str(text)[:4000]})
+            status = "success" if answer.strip() and sources else (
+                "no_hit" if references == [] or not answer.strip() else "unverified")
+            result = {"status": status, "answer": answer[:16000], "sources": sources[:8],
+                      "assistant": chat_name, "question": question, "error_code": None}
+        except PolicyViolation:
+            raise
+        except Exception as error:
+            result = _error(error, phase=phase, elapsed_ms=round((monotonic() - started) * 1000))
+        finally:
+            if chat is not None and session is not None:
+                try:
+                    chat.delete_sessions(ids=[session.id])
+                except Exception as error:
+                    logger.warning("RAG 临时会话清理失败 run_id=%s error_type=%s", ctx.run_id, type(error).__name__)
+        ctx.finish_rag(result)
+        detail = f"（{result.get('error_type')}，{_PHASE_NAMES.get(result.get('phase'), '')}阶段）" if result["status"] == "error" else ""
+        ctx.emit("rag_outcome", f"知识库查询状态：{result['status']}{detail}", status=result["status"],
+                 error_code=result.get("error_code"), phase=result.get("phase"),
+                 error_type=result.get("error_type"), elapsed_ms=result.get("elapsed_ms"),
+                 timeout_seconds=result.get("timeout_seconds"))
         return result
-    except Exception as e:
-        print(f"[RAGFlow] query failed: {e}")
-        return f"提问失败，错误原因：{str(e)}"
-    finally:
-        if use_chat is not None and session is not None:
-            try:
-                use_chat.delete_sessions(ids=[session.id])
-            except Exception as e:
-                print(f"[RAGFlow] 临时会话清理失败：{e}")
-
-# if __name__ == '__main__':
-#     # print(get_assistant_list())
-#     # print(create_ask_delete("你的助手名称", "你的问题"))
