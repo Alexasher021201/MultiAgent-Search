@@ -8,7 +8,7 @@ load_dotenv(find_dotenv())
 
 # 控制单次模型回复的预算，避免多智能体的提示词和输出预留一起超过 TPM。
 # 如需更长报告，可在 .env 中提高 LLM_MAX_OUTPUT_TOKENS。
-max_output_tokens = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1000"))
+max_output_tokens = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1500"))
 # 避免上游请求或 SDK 重试让后台任务长时间无反馈。
 request_timeout_seconds = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60"))
 max_retries = int(os.getenv("LLM_MAX_RETRIES", "0"))
@@ -24,5 +24,3 @@ model = init_chat_model(
     max_retries=max_retries,
     reasoning_effort=reasoning_effort,
 )
-response = model.invoke("what time is it now?")
-print(response.content)

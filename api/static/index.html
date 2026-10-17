@@ -184,7 +184,8 @@
 
 <div class="input-bar">
   <input id="queryInput" type="text" placeholder="输入分析问题，例如：帮我分析最近电商行业的热门品类趋势" />
-  <button class="btn btn-primary" id="sendBtn" onclick="sendTask()">▶ 发送新任务</button>
+  <button class="btn btn-primary" id="sendBtn" onclick="sendTask()">▶ 发送</button>
+  <button class="btn btn-ghost" onclick="newSession()">＋ 新建会话</button>
   <button class="btn btn-ghost" onclick="closeAllSessions()">清除全部</button>
 </div>
 
@@ -205,7 +206,7 @@
 
 <script>
 // ── 会话管理 ──
-const sessions = {};    // { threadId: { id, query, logs[], ws, dir, status, element } }
+const sessions = {};    // 同一标签页始终复用同一个 thread_id 和消息记录。
 let activeSessionId = null;
 let fileRefreshTimer = null;
 
@@ -213,6 +214,7 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
 const tagMap = {
+  user_message:    { dot:'a', tag:'a', text:'提问' },
   session_created: { dot:'s', tag:'s', text:'会话' },
   assistant_call:  { dot:'a', tag:'a', text:'调度' },
   tool_start:      { dot:'t', tag:'t', text:'工具' },
@@ -220,24 +222,81 @@ const tagMap = {
   error:           { dot:'e', tag:'e', text:'错误' },
 };
 
-function createSession(threadId, query) {
+function newSession() {
+  // 在提交任务前确定 ID，便于先建立 WebSocket，避免丢失很快返回的结果。
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  const threadId = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
   const session = {
     id: threadId,
-    query,
+    query: '新会话',
     logs: [],
     ws: null,
+    connection: null,
     dir: null,
-    status: 'running', // running | done | error
-    el: null,
+    status: 'idle', // idle | running | done | error
+    submitting: false,
   };
   sessions[threadId] = session;
+  switchSession(threadId);
+  updateWSStatus();
+  $('#queryInput').focus();
+  return session;
+}
 
-  // 连 WebSocket
+function updateComposer() {
+  const session = sessions[activeSessionId];
+  const busy = session && (session.submitting || session.status === 'running');
+  $('#sendBtn').disabled = !!busy;
+  $('#sendBtn').textContent = busy ? '处理中…' : session?.logs.length ? '▶ 继续提问' : '▶ 发送';
+  $('#queryInput').placeholder = session?.logs.length
+    ? '继续当前会话提问，Agent 会参考此前对话'
+    : '输入分析问题，例如：帮我分析最近电商行业的热门品类趋势';
+}
+
+function connectSession(session) {
+  if (session.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+  if (session.connection) return session.connection;
+
+  const threadId = session.id;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = `${proto}//${location.host}/ws/${threadId}`;
   const ws = new WebSocket(url);
-  ws.onopen = () => { updateWSStatus(); };
+  session.ws = ws;
+  const connection = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('实时连接超时，请稍后重试'));
+      ws.close();
+    }, 10000);
+    ws.onopen = () => {
+      clearTimeout(timeout);
+      updateWSStatus();
+      resolve();
+    };
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      reject(new Error('无法建立实时连接，请确认服务正常运行'));
+    };
+    ws.onclose = () => {
+      clearTimeout(timeout);
+      reject(new Error('实时连接已断开'));
+      if (sessions[threadId] !== session || session.ws !== ws) return;
+      session.ws = null;
+      // 断线不代表后台任务已完成，不能据此放开同一会话的并发提交。
+      if (session.status === 'running') {
+        session.logs.push({ event: 'error', message: '实时连接已断开，后台任务可能仍在执行；请勿重复提交本轮问题。', timestamp: new Date().toISOString() });
+        if (activeSessionId === threadId) renderLog(session);
+      }
+      updateWSStatus();
+      renderTabs();
+      updateComposer();
+    };
+  });
+  session.connection = connection.finally(() => { session.connection = null; });
   ws.onmessage = (e) => {
+    if (sessions[threadId] !== session || session.ws !== ws) return;
     try {
       const d = JSON.parse(e.data);
       if (d.type === 'pong') return;
@@ -252,21 +311,11 @@ function createSession(threadId, query) {
       if (d.event === 'error') { session.status = 'error'; }
 
       renderTabs();
+      updateComposer();
       if (activeSessionId === threadId) renderLog(session);
     } catch (_) {}
   };
-  ws.onclose = () => {
-    if (session.status === 'running') session.status = 'done';
-    updateWSStatus();
-    renderTabs();
-  };
-  ws.onerror = () => { session.status = 'error'; updateWSStatus(); renderTabs(); };
-  session.ws = ws;
-
-  // 切换到此会话
-  switchSession(threadId);
-  renderTabs();
-  scheduleFileRefresh();
+  return session.connection;
 }
 
 function switchSession(threadId) {
@@ -282,6 +331,7 @@ function switchSession(threadId) {
   // 恢复滚动位置
   $('#logArea').scrollTop = s._scrollTop || 0;
   renderTabs();
+  updateComposer();
   refreshFiles();
 }
 
@@ -302,6 +352,7 @@ function closeSession(threadId) {
   }
   renderTabs();
   updateWSStatus();
+  updateComposer();
 }
 
 function closeAllSessions() {
@@ -313,6 +364,7 @@ function closeAllSessions() {
   renderLog(null);
   renderTabs();
   updateWSStatus();
+  updateComposer();
 }
 
 // ── 标签栏渲染 ──
@@ -324,7 +376,7 @@ function renderTabs() {
   bar.innerHTML = ids.map(id => {
     const s = sessions[id];
     const active = id === activeSessionId ? ' active' : '';
-    const statusIcon = s.status === 'running' ? '⏳' : s.status === 'error' ? '❌' : '✅';
+    const statusIcon = s.status === 'running' ? '⏳' : s.status === 'error' ? '❌' : s.status === 'idle' ? '💬' : '✅';
     return `<div class="tab${active}" onclick="switchSession('${id}')">
       <span class="tab-status ${s.status}">${statusIcon}</span>
       <span class="tab-query" title="${escapeAttr(s.query)}">${escapeHtml(s.query.substring(0, 20))}${s.query.length > 20 ? '...' : ''}</span>
@@ -337,13 +389,13 @@ function renderTabs() {
 function renderLog(session) {
   const area = $('#logArea');
   if (!session || session.logs.length === 0) {
-    area.innerHTML = `<div class="empty-state"><div class="icon">📋</div><div>${session ? '等待 Agent 响应...' : '发送一个任务开始调试'}</div></div>`;
+    area.innerHTML = `<div class="empty-state"><div class="icon">📋</div><div>${session ? '发送第一条消息开始对话' : '发送消息或新建会话开始对话'}</div></div>`;
     return;
   }
   area.innerHTML = session.logs.map(l => {
     const t = tagMap[l.event] || tagMap.tool_start;
     const resultBlock = l.data?.result
-      ? `<div class="log-result-block">${escapeHtml(l.data.result.substring(0, 800))}${l.data.result.length > 800 ? '…' : ''}</div>`
+      ? `<div class="log-result-block">${escapeHtml(l.data.result)}</div>`
       : '';
     return `<div class="log-entry">
       <div class="log-dot ${t.dot}"></div>
@@ -361,23 +413,49 @@ function renderLog(session) {
 async function sendTask() {
   const input = $('#queryInput');
   const query = input.value.trim();
-  if (!query) return;
-
-  const btn = $('#sendBtn');
-  btn.disabled = true; btn.textContent = '发送中...';
+  if (!query || $('#sendBtn').disabled) return;
+  const session = sessions[activeSessionId] || newSession();
+  if (session.submitting || session.status === 'running') return;
+  const previousStatus = session.status;
+  let requestStarted = false;
+  session.submitting = true;
+  updateComposer();
 
   try {
+    await connectSession(session);
+    // 等待连接期间，用户可能关闭或清除了会话。
+    if (sessions[session.id] !== session) return;
+    session.status = 'running';
+    if (!session.logs.some(log => log.event === 'user_message')) session.query = query;
+    session.logs.push({ event: 'user_message', message: query, timestamp: new Date().toISOString() });
+    renderTabs();
+    if (activeSessionId === session.id) renderLog(session);
+    requestStarted = true;
     const res = await fetch('/api/task', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query, thread_id: session.id }),
     });
+    if (!res.ok) {
+      session.status = 'error';
+      throw new Error(`服务返回 HTTP ${res.status}`);
+    }
     const data = await res.json();
-    createSession(data.thread_id, query);
+    if (data.status !== 'started' || data.thread_id !== session.id) {
+      throw new Error('服务未确认当前会话任务，请检查服务状态');
+    }
+    if (input.value.trim() === query) input.value = '';
   } catch (err) {
+    // 未提交到后台时可以重试；提交后的连接异常不能视作后台任务结束。
+    if (!requestStarted) session.status = previousStatus;
+    if (sessions[session.id] === session) {
+      session.logs.push({ event: 'error', message: err.message + (session.status === 'running' ? '；后台任务状态尚未确认，请勿重复提交。' : ''), timestamp: new Date().toISOString() });
+      if (activeSessionId === session.id) renderLog(session);
+    }
     alert('请求失败: ' + err.message);
   } finally {
-    btn.disabled = false; btn.textContent = '▶ 发送新任务';
-    input.value = '';
+    session.submitting = false;
+    renderTabs();
+    updateComposer();
     input.focus();
   }
 }
@@ -464,6 +542,8 @@ $('#queryInput').addEventListener('keydown', e => {
 
 // ── 初始 ──
 updateWSStatus();
+updateComposer();
+renderLog(null);
 refreshFiles();
 </script>
 </body>
