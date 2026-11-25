@@ -17,7 +17,7 @@ reasoning_effort = os.getenv("LLM_REASONING_EFFORT", "minimal")
 
 model = init_chat_model(
     model=os.getenv("LLM_QWEN_MAX"),
-    model_provider="openai",
+    model_provider="deepseek",
     max_tokens=max_output_tokens,
     timeout=request_timeout_seconds,
     temperature=1.0, #控制模型输出的随机性，值越高输出越随机，值越低输出越确定

@@ -18,8 +18,8 @@ class RetrievalMode(StrEnum):
 class RunPolicy:
     mode: RetrievalMode
     allow_web: bool = True
-    max_web_calls: int = 2
-    max_rag_calls: int = 2
+    max_web_calls: int = 3
+    max_rag_calls: int = 3
     max_web_http_attempts: int = 4
     max_tool_calls: int = 20
     max_model_calls: int = 12
@@ -77,7 +77,7 @@ def resolve_policy(
             mode = RetrievalMode.RAG_FIRST
         elif internal:
             mode = RetrievalMode.RAG_ONLY
-        elif any(word in lowered for word in ("搜索", "搜一下", "查一下", "最新", "新闻", "竞品", "行业趋势")):
+        elif any(word in lowered for word in ("搜索", "搜一下", "查一下", "最新", "新闻", "竞品", "行业趋势","明天","未来某一天")):
             mode = RetrievalMode.WEB_ONLY
         else:
             mode = RetrievalMode.DIRECT

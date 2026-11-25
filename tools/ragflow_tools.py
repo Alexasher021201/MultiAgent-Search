@@ -30,6 +30,32 @@ class RagTransportError(Exception):
         self.elapsed_ms = elapsed_ms
 
 
+class RagCompletionError(Exception):
+    """RAGFlow 已返回 HTTP 响应，但没有提供可交给 SDK 的回答。"""
+
+    def __init__(self, error_type, *, timed_out=False):
+        super().__init__(error_type)
+        self.error_type = error_type
+        self.timed_out = timed_out
+
+
+def _check_completion_response(response):
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RagCompletionError("InvalidRagResponse") from None
+    if not isinstance(payload, dict) or "code" not in payload:
+        raise RagCompletionError("InvalidRagResponse")
+    if payload["code"] != 0:
+        message = str(payload.get("message", "")).casefold()
+        if any(marker in message for marker in ("timed out", "timeout", "time out")):
+            raise RagCompletionError("RagUpstreamTimeout", timed_out=True)
+        raise RagCompletionError("RagUpstreamError")
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("answer"), str):
+        raise RagCompletionError("InvalidRagResponse")
+
+
 class _BoundedRAGFlow(RAGFlow):
     """当前 SDK 没有传输超时；为所有 HTTP 方法设置边界。"""
 
@@ -51,6 +77,8 @@ class _BoundedRAGFlow(RAGFlow):
             response = requests.request(method, self.api_url + path, headers=self.authorization_header,
                                         timeout=(connect, read), **kwargs)
             response.raise_for_status()
+            if phase == "ask" and not kwargs.get("stream"):
+                _check_completion_response(response)
             return response
         except requests.RequestException as error:
             elapsed_ms = round((monotonic() - started) * 1000)
@@ -91,8 +119,15 @@ def _error(error, code="RAG_REQUEST_FAILED", *, phase="ask", elapsed_ms=None):
     # 不向模型或前端暴露上游异常原文。
     timed_out = isinstance(error, (requests.Timeout, TimeoutError)) or getattr(error, "timed_out", False)
     phase = getattr(error, "phase", phase)
-    message = (f"知识库在{_PHASE_NAMES.get(phase, phase)}阶段超时，本轮未获得有效检索结果。"
-               "请稍后重试，或检查 RAGFlow 模型响应时间及超时配置。") if timed_out else "知识库调用失败，请检查服务配置或运行日志"
+    if isinstance(error, RagCompletionError):
+        code = "RAG_INVALID_RESPONSE" if error.error_type == "InvalidRagResponse" else "RAG_UPSTREAM_ERROR"
+        message = ("RAGFlow 服务端处理知识库问答超时，请稍后重试或查看 RAGFlow 日志。" if timed_out else
+                   "RAGFlow 未返回可用的回答，请查看 RAGFlow 服务端日志。")
+    elif timed_out:
+        message = (f"知识库在{_PHASE_NAMES.get(phase, phase)}阶段超时，本轮未获得有效检索结果。"
+                   "请稍后重试，或检查 RAGFlow 模型响应时间及超时配置。")
+    else:
+        message = "知识库调用失败，请检查服务配置或运行日志"
     return {"status": "error", "answer": "", "sources": [],
             "error_code": "RAG_TIMEOUT" if timed_out else code,
             "error_type": getattr(error, "error_type", type(error).__name__), "message": message,

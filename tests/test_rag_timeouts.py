@@ -85,6 +85,7 @@ class RagTransportTests(unittest.TestCase):
         ctx = RunContext(policy, "威龙")
         client = rag._BoundedRAGFlow("fake-key", "http://example.invalid")
         with use_run_context(ctx), patch.object(rag.requests, "request") as request:
+            request.return_value.json.return_value = {"code": 0, "data": {"answer": "测试回答"}}
             client.post("/chats/id/completions", json={})
             self.assertEqual(request.call_args.kwargs["timeout"], (5, 75))
             client.get("/chats")
@@ -106,6 +107,18 @@ class RagTransportTests(unittest.TestCase):
         self.assertEqual(outcome["phase"], "ask")
         self.assertEqual(outcome["error_type"], "ReadTimeout")
         self.assertEqual(outcome["timeout_seconds"], 90)
+        self.assertNotIn("secret-token", json.dumps(outcome))
+
+    def test_completion_reports_upstream_timeout_before_sdk_unpacks_null_data(self):
+        ctx = RunContext(RunPolicy(RetrievalMode.RAG_ONLY), "威龙")
+        client = rag._BoundedRAGFlow("fake-key", "http://example.invalid")
+        with use_run_context(ctx), patch.object(rag.requests, "request") as request:
+            request.return_value.json.return_value = {"code": 100, "message": "Request timed out. secret-token", "data": None}
+            with self.assertRaises(rag.RagCompletionError) as caught:
+                client.post("/chats/id/completions", json={})
+        outcome = rag._error(caught.exception)
+        self.assertEqual(outcome["error_code"], "RAG_TIMEOUT")
+        self.assertEqual(outcome["error_type"], "RagUpstreamTimeout")
         self.assertNotIn("secret-token", json.dumps(outcome))
 
 
